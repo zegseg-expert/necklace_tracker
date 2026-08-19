@@ -1,101 +1,189 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-  <title>TrackLace Dashboard</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-  
-  <!-- Firebase SDK -->
-  <script src="https://www.gstatic.com/firebasejs/8.10.0/firebase-app.js"></script>
-  <script src="https://www.gstatic.com/firebasejs/8.10.0/firebase-database.js"></script>
-  
-  <style>
-    body { font-family: Arial; margin: 20px; background: #f4f4f4; }
-    .card { background: white; padding: 15px; border-radius: 10px; margin-bottom: 15px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
-    #map { height: 400px; width: 100%; border-radius: 10px; }
-    .status-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-    .status-item { padding: 10px; border-radius: 5px; text-align: center; background: #eee; }
-    .status-item h3 { margin: 0; font-size: 14px; color: #555; }
-    .status-item p { margin: 5px 0 0; font-size: 18px; font-weight: bold; }
-    .online { color: green; }
-    .offline { color: red; }
-    table { width: 100%; border-collapse: collapse; }
-    th, td { text-align: left; padding: 8px; border-bottom: 1px solid #ddd; }
-    th { background-color: #f2f2f2; }
-  </style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TrackLace Guardian</title>
+    <!-- Leaflet Map -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <!-- Firebase SDK -->
+    <script src="https://www.gstatic.com/firebasejs/8.10.0/firebase-app.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/8.10.0/firebase-database.js"></script>
+    <style>
+        body { font-family: Arial; margin: 0; background: #f0f2f5; }
+        .header { background: #1a73e8; color: white; padding: 20px; text-align: center; }
+        .container { max-width: 800px; margin: 20px auto; padding: 0 15px; }
+        .card { background: white; border-radius: 12px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+        .status-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }
+        .stat { text-align: center; }
+        .stat h3 { margin: 0; font-size: 14px; color: #666; }
+        .stat p { font-size: 24px; font-weight: bold; margin: 5px 0; }
+        #map { height: 350px; width: 100%; border-radius: 10px; }
+        .alert-box { background: #ffebee; color: #b71c1c; padding: 15px; border-radius: 8px; display: none; text-align: center; font-weight: bold; font-size: 18px; border: 2px solid #b71c1c; }
+        .btn { background: #1a73e8; color: white; border: none; padding: 12px 20px; border-radius: 8px; font-size: 16px; cursor: pointer; width: 100%; margin-top: 10px; }
+        .btn:hover { background: #1557b0; }
+        table { width: 100%; border-collapse: collapse; font-size: 14px; }
+        th, td { padding: 10px; text-align: left; border-bottom: 1px solid #ddd; }
+        th { background: #f8f9fa; }
+        .green { color: green; } .red { color: red; }
+    </style>
 </head>
 <body>
 
-  <div class="card">
-    <h1>TrackLace Guardian Dashboard</h1>
-    <div class="status-grid">
-      <div class="status-item"><h3>🛰️ GPS Status</h3><p id="gpsStatus">Loading...</p></div>
-      <div class="status-item"><h3>🚶 Activity</h3><p id="activityStatus">Loading...</p></div>
-      <div class="status-item"><h3>⚠️ Fall Detection</h3><p id="fallStatus">Loading...</p></div>
-      <div class="status-item"><h3>📡 Last Update</h3><p id="lastUpdate">Loading...</p></div>
+    <div class="header">
+        <h1>🛡️ TrackLace Guardian</h1>
+        <p>Real-time safety monitoring & phone GPS fallback</p>
     </div>
-  </div>
 
-  <div class="card">
-    <div id="map"></div>
-  </div>
+    <div class="container">
+        <!-- Emergency Alert -->
+        <div id="fallAlert" class="alert-box">🚨 FALL DETECTED! Location being acquired...</div>
 
-  <div class="card">
-    <h2>Last 10 History Events</h2>
-    <table>
-      <thead><tr><th>Time</th><th>Lat</th><th>Lng</th><th>Activity</th></tr></thead>
-      <tbody id="historyTable"></tbody>
-    </table>
-  </div>
+        <!-- Status Cards -->
+        <div class="card">
+            <div class="status-grid">
+                <div class="stat"><h3>🛰️ GPS Source</h3><p id="gpsSource">Waiting...</p></div>
+                <div class="stat"><h3>🚶 Activity</h3><p id="activity">--</p></div>
+                <div class="stat"><h3>📡 Last Update</h3><p id="lastUpdate">--</p></div>
+                <div class="stat"><h3>📶 GSM</h3><p id="gsmStatus" class="green">Online</p></div>
+            </div>
+        </div>
 
-  <script>
-    // 🔴 REPLACE WITH YOUR FIREBASE CONFIG
-    const firebaseConfig = {
-      apiKey: "YOUR_FIREBASE_API_KEY",
-      databaseURL: "YOUR_FIREBASE_DATABASE_URL"
-    };
-    
-    firebase.initializeApp(firebaseConfig);
-    const db = firebase.database();
+        <!-- Map -->
+        <div class="card">
+            <div id="map"></div>
+        </div>
 
-    // Initialize Map (default center FUT Minna)
-    const map = L.map('map').setView([9.656186, 6.529398], 15);
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
-    let marker;
+        <!-- Manual Fallback Button (For Testing) -->
+        <div class="card">
+            <button id="usePhoneGpsBtn" class="btn">📱 Force Use Phone GPS Now</button>
+            <p style="font-size:12px; color:#777; text-align:center; margin-top:5px;">If hardware GPS is slow, click this to use your phone's location.</p>
+        </div>
 
-    // Listen to real-time data
-    const neckRef = db.ref('/necklace');
-    neckRef.on('value', (snapshot) => {
-      const data = snapshot.val();
-      if(!data) return;
+        <!-- History -->
+        <div class="card">
+            <h2>Last 10 Events</h2>
+            <table>
+                <thead><tr><th>Time</th><th>Lat</th><th>Lng</th><th>Activity</th></tr></thead>
+                <tbody id="historyBody"></tbody>
+            </table>
+        </div>
+    </div>
 
-      document.getElementById('gpsStatus').innerHTML = data.gpsFix ? '<span class="online">Locked</span>' : '<span class="offline">No Fix</span>';
-      document.getElementById('activityStatus').innerText = data.activity || "Unknown";
-      document.getElementById('fallStatus').innerText = data.alert === "FALL" ? "🚨 FALL DETECTED!" : "✅ Safe";
-      document.getElementById('lastUpdate').innerText = new Date().toLocaleString();
+    <script>
+        // 🔴 STEP 2: PASTE YOUR FIREBASE CONFIG HERE LATER
+        const firebaseConfig = {
+            apiKey: "YOUR_API_KEY",
+            databaseURL: "YOUR_DATABASE_URL"
+        };
+        firebase.initializeApp(firebaseConfig);
+        const db = firebase.database();
 
-      if(data.lat && data.lng) {
-        const latlng = [data.lat, data.lng];
-        if(marker) marker.setLatLng(latlng);
-        else marker = L.marker(latlng).addTo(map);
-        map.panTo(latlng);
-      }
-    });
+        // Init Map
+        const map = L.map('map').setView([9.656, 6.529], 15);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
+        let marker;
 
-    // Listen to History (last 10)
-    const histRef = db.ref('/history').limitToLast(10);
-    histRef.on('value', (snapshot) => {
-      const hist = snapshot.val();
-      const tbody = document.getElementById('historyTable');
-      tbody.innerHTML = '';
-      if(!hist) return;
-      Object.keys(hist).reverse().forEach(key => {
-        const h = hist[key];
-        const row = `<tr><td>${h.time || '--'}</td><td>${h.lat || 0}</td><td>${h.lng || 0}</td><td>${h.activity || '--'}</td></tr>`;
-        tbody.innerHTML += row;
-      });
-    });
-  </script>
+        // ── Listen to ESP32 Data ──────────────────────────────
+        const necklaceRef = db.ref('/necklace');
+        necklaceRef.on('value', (snapshot) => {
+            const data = snapshot.val();
+            if (!data) return;
+
+            document.getElementById('activity').innerText = data.activity || "STATIONARY";
+            document.getElementById('lastUpdate').innerText = new Date().toLocaleTimeString();
+            
+            if (data.lat && data.lng) {
+                const pos = [data.lat, data.lng];
+                if (marker) marker.setLatLng(pos);
+                else marker = L.marker(pos).addTo(map);
+                map.panTo(pos);
+                document.getElementById('gpsSource').innerHTML = '<span class="green">Hardware GPS</span>';
+            }
+        });
+
+        // ── Listen for FALL Alerts ─────────────────────────────
+        const alertRef = db.ref('/alerts/lastFall');
+        alertRef.on('value', (snapshot) => {
+            const fallData = snapshot.val();
+            if (fallData && fallData.status === "FALL_DETECTED") {
+                document.getElementById('fallAlert').style.display = 'block';
+                document.getElementById('fallAlert').innerText = "🚨 FALL DETECTED! Getting phone GPS...";
+                
+                // Automatically trigger phone GPS after 2 seconds
+                setTimeout(() => {
+                    getPhoneGPSAndSend();
+                }, 2000);
+            }
+        });
+
+        // ── History Listener ──────────────────────────────────
+        const historyRef = db.ref('/history').limitToLast(10);
+        historyRef.on('value', (snapshot) => {
+            const hist = snapshot.val();
+            const tbody = document.getElementById('historyBody');
+            tbody.innerHTML = '';
+            if (!hist) return;
+            Object.keys(hist).reverse().forEach(key => {
+                const h = hist[key];
+                tbody.innerHTML += `<tr><td>${h.time || '--'}</td><td>${h.lat || 0}</td><td>${h.lng || 0}</td><td>${h.activity || '--'}</td></tr>`;
+            });
+        });
+
+        // ── PHONE GPS FUNCTION (Fallback) ─────────────────────
+        function getPhoneGPSAndSend() {
+            if (!navigator.geolocation) {
+                alert("Your browser does not support GPS.");
+                return;
+            }
+            document.getElementById('fallAlert').innerText = "📱 Using Phone GPS to get location...";
+            
+            navigator.geolocation.getCurrentPosition(
+                (position) => {
+                    const lat = position.coords.latitude;
+                    const lng = position.coords.longitude;
+                    
+                    // Send to Firebase
+                    db.ref('/necklace').update({
+                        lat: lat,
+                        lng: lng,
+                        gpsSource: "Phone GPS (Fallback)"
+                    });
+                    
+                    // Also save to history
+                    db.ref('/history').push({
+                        lat: lat,
+                        lng: lng,
+                        activity: "FALL (Phone GPS)",
+                        time: new Date().toISOString()
+                    });
+
+                    document.getElementById('fallAlert').innerText = "✅ Location found via Phone GPS! SMS sent to caregiver.";
+                    document.getElementById('gpsSource').innerHTML = '<span class="red">Phone GPS (Fallback)</span>';
+                    
+                    // Trigger SIM800L SMS via Firebase command
+                    db.ref('/commands').set({
+                        action: "SEND_SMS",
+                        lat: lat,
+                        lng: lng,
+                        timestamp: Date.now()
+                    });
+
+                    setTimeout(() => {
+                        document.getElementById('fallAlert').style.display = 'none';
+                    }, 10000);
+                },
+                (error) => {
+                    document.getElementById('fallAlert').innerText = "❌ Failed to get phone GPS. Check permissions.";
+                    console.error(error);
+                },
+                { enableHighAccuracy: true, timeout: 15000 }
+            );
+        }
+
+        // Manual button trigger
+        document.getElementById('usePhoneGpsBtn').addEventListener('click', getPhoneGPSAndSend);
+    </script>
 </body>
 </html>
