@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>TrackLace Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  
+  <!-- Firebase SDK -->
+  <script src="https://www.gstatic.com/firebasejs/8.10.0/firebase-app.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/8.10.0/firebase-database.js"></script>
+  
+  <style>
+    body { font-family: Arial; margin: 20px; background: #f4f4f4; }
+    .card { background: white; padding: 15px; border-radius: 10px; margin-bottom: 15px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+    #map { height: 400px; width: 100%; border-radius: 10px; }
+    .status-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .status-item { padding: 10px; border-radius: 5px; text-align: center; background: #eee; }
+    .status-item h3 { margin: 0; font-size: 14px; color: #555; }
+    .status-item p { margin: 5px 0 0; font-size: 18px; font-weight: bold; }
+    .online { color: green; }
+    .offline { color: red; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 8px; border-bottom: 1px solid #ddd; }
+    th { background-color: #f2f2f2; }
+  </style>
+</head>
+<body>
+
+  <div class="card">
+    <h1>TrackLace Guardian Dashboard</h1>
+    <div class="status-grid">
+      <div class="status-item"><h3>🛰️ GPS Status</h3><p id="gpsStatus">Loading...</p></div>
+      <div class="status-item"><h3>🚶 Activity</h3><p id="activityStatus">Loading...</p></div>
+      <div class="status-item"><h3>⚠️ Fall Detection</h3><p id="fallStatus">Loading...</p></div>
+      <div class="status-item"><h3>📡 Last Update</h3><p id="lastUpdate">Loading...</p></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div id="map"></div>
+  </div>
+
+  <div class="card">
+    <h2>Last 10 History Events</h2>
+    <table>
+      <thead><tr><th>Time</th><th>Lat</th><th>Lng</th><th>Activity</th></tr></thead>
+      <tbody id="historyTable"></tbody>
+    </table>
+  </div>
+
+  <script>
+    // 🔴 REPLACE WITH YOUR FIREBASE CONFIG
+    const firebaseConfig = {
+      apiKey: "YOUR_FIREBASE_API_KEY",
+      databaseURL: "YOUR_FIREBASE_DATABASE_URL"
+    };
+    
+    firebase.initializeApp(firebaseConfig);
+    const db = firebase.database();
+
+    // Initialize Map (default center FUT Minna)
+    const map = L.map('map').setView([9.656186, 6.529398], 15);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
+    let marker;
+
+    // Listen to real-time data
+    const neckRef = db.ref('/necklace');
+    neckRef.on('value', (snapshot) => {
+      const data = snapshot.val();
+      if(!data) return;
+
+      document.getElementById('gpsStatus').innerHTML = data.gpsFix ? '<span class="online">Locked</span>' : '<span class="offline">No Fix</span>';
+      document.getElementById('activityStatus').innerText = data.activity || "Unknown";
+      document.getElementById('fallStatus').innerText = data.alert === "FALL" ? "🚨 FALL DETECTED!" : "✅ Safe";
+      document.getElementById('lastUpdate').innerText = new Date().toLocaleString();
+
+      if(data.lat && data.lng) {
+        const latlng = [data.lat, data.lng];
+        if(marker) marker.setLatLng(latlng);
+        else marker = L.marker(latlng).addTo(map);
+        map.panTo(latlng);
+      }
+    });
+
+    // Listen to History (last 10)
+    const histRef = db.ref('/history').limitToLast(10);
+    histRef.on('value', (snapshot) => {
+      const hist = snapshot.val();
+      const tbody = document.getElementById('historyTable');
+      tbody.innerHTML = '';
+      if(!hist) return;
+      Object.keys(hist).reverse().forEach(key => {
+        const h = hist[key];
+        const row = `<tr><td>${h.time || '--'}</td><td>${h.lat || 0}</td><td>${h.lng || 0}</td><td>${h.activity || '--'}</td></tr>`;
+        tbody.innerHTML += row;
+      });
+    });
+  </script>
+</body>
+</html>
