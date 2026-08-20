@@ -98,7 +98,6 @@
             transition: background 0.2s;
         }
         .btn:hover { background: #1557b0; }
-        .btn:active { background: #0d47a1; }
         
         table {
             width: 100%;
@@ -201,7 +200,6 @@
         </div>
     </div>
 
-    <!-- ── JAVASCRIPT ────────────────────────────────────────── -->
     <script>
         // ── YOUR FIREBASE CONFIG ──────────────────────────────
         const firebaseConfig = {
@@ -212,7 +210,6 @@
         const db = firebase.database();
 
         // ── INITIALIZE MAP ────────────────────────────────────
-        // Default view: Federal University of Technology, Minna
         const map = L.map('map').setView([9.656186, 6.529398], 15);
         L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
             attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
@@ -227,7 +224,6 @@
             const data = snapshot.val();
             if (!data) return;
 
-            // Update GPS Status
             const gpsEl = document.getElementById('gpsStatus');
             if (data.gpsStatus === 'FIXED') {
                 gpsEl.innerHTML = '<span class="status-badge badge-green">Fixed</span>';
@@ -235,10 +231,7 @@
                 gpsEl.innerHTML = '<span class="status-badge badge-yellow">Searching</span>';
             }
 
-            // Update Activity
             document.getElementById('activity').innerText = data.activity || '--';
-
-            // Update Position
             const posEl = document.getElementById('position');
             if (data.lat && data.lng) {
                 posEl.innerText = data.lat.toFixed(6) + ', ' + data.lng.toFixed(6);
@@ -246,7 +239,6 @@
                 posEl.innerText = 'No Fix';
             }
 
-            // Update Map Marker
             if (data.lat && data.lng) {
                 const latlng = [data.lat, data.lng];
                 if (marker) {
@@ -266,7 +258,6 @@
             const fallEl = document.getElementById('fallStatus');
             if (fall && fall.status === 'FALL_DETECTED') {
                 fallEl.innerHTML = '<span class="status-badge badge-red">🚨 FALL DETECTED!</span>';
-                // Auto-reset after 10 seconds
                 setTimeout(() => {
                     fallEl.innerText = 'Monitoring';
                 }, 10000);
@@ -281,9 +272,7 @@
             const g = snapshot.val();
             if (g && g.lat && g.lng && g.radius) {
                 const center = [g.lat, g.lng];
-                // Remove old circle if it exists
                 if (geofenceCircle) map.removeLayer(geofenceCircle);
-                // Draw new circle
                 geofenceCircle = L.circle(center, {
                     radius: g.radius,
                     color: '#1a73e8',
@@ -291,7 +280,6 @@
                     fillOpacity: 0.15,
                     weight: 2
                 }).addTo(map);
-                // Update UI sliders
                 document.getElementById('radiusSlider').value = g.radius;
                 document.getElementById('radiusDisplay').innerText = g.radius;
             }
@@ -307,7 +295,6 @@
                 tbody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: #6c757d;">No history yet...</td></tr>';
                 return;
             }
-            // Get last 10 keys and reverse (newest first)
             const keys = Object.keys(hist).slice(-10).reverse();
             keys.forEach(key => {
                 const row = hist[key];
@@ -325,10 +312,8 @@
         // ── GEOFENCE UI CONTROLS ──────────────────────────────
         let selectedGeoCenter = null;
 
-        // Update radius text when slider moves
         document.getElementById('radiusSlider').addEventListener('input', function() {
             document.getElementById('radiusDisplay').innerText = this.value;
-            // If center is already selected, redraw the circle with new radius
             if (selectedGeoCenter) {
                 if (geofenceCircle) map.removeLayer(geofenceCircle);
                 const radius = parseInt(this.value);
@@ -342,7 +327,6 @@
             }
         });
 
-        // Click on map to set geofence center
         map.on('click', function(e) {
             selectedGeoCenter = e.latlng;
             const radius = parseInt(document.getElementById('radiusSlider').value);
@@ -354,15 +338,12 @@
                 fillOpacity: 0.15,
                 weight: 2
             }).addTo(map);
-            
-            // Show a small popup confirming the center
             L.popup()
                 .setLatLng(selectedGeoCenter)
                 .setContent("📍 Geofence Center Set")
                 .openOn(map);
         });
 
-        // Send Geofence to Firebase / ESP32
         document.getElementById('sendGeofenceBtn').addEventListener('click', function() {
             if (!selectedGeoCenter) {
                 alert("⚠️ Please click on the map to set a center point first!");
@@ -375,8 +356,6 @@
                 radius: radius,
                 timestamp: new Date().toISOString()
             };
-            
-            // Write to Firebase
             db.ref('/geofence').set(geoData)
                 .then(() => {
                     alert("✅ Geofence sent to ESP32 successfully!");
@@ -385,10 +364,6 @@
                     alert("❌ Error sending geofence: " + error.message);
                 });
         });
-
-        // ── INITIAL STARTUP MESSAGE ───────────────────────────
-        console.log("TrackLace Guardian Dashboard loaded successfully.");
-        console.log("Connected to Firebase:", firebaseConfig.databaseURL);
     </script>
 </body>
 </html>
