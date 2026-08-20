@@ -1,106 +1,346 @@
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <title>TrackLace Guardian Dashboard</title>
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-  <script src="https://www.gstatic.com/firebasejs/8.10.0/firebase-app.js"></script>
-  <script src="https://www.gstatic.com/firebasejs/8.10.0/firebase-database.js"></script>
-  <style>
-    body { font-family: Arial, sans-serif; margin: 0; background: #f4f6f8; }
-    .header { background: #1a73e8; color: white; padding: 20px; text-align: center; }
-    .container { max-width: 1000px; margin: 20px auto; padding: 0 15px; }
-    .card { background: white; padding: 20px; border-radius: 12px; margin-bottom: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
-    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }
-    .stat { text-align: center; background: #f8f9fa; padding: 15px; border-radius: 8px; }
-    .stat h4 { margin: 0 0 5px; color: #555; }
-    .stat p { font-size: 20px; font-weight: bold; margin: 0; }
-    #map { height: 400px; width: 100%; border-radius: 10px; }
-    table { width: 100%; border-collapse: collapse; font-size: 14px; }
-    th, td { padding: 10px; text-align: left; border-bottom: 1px solid #ddd; }
-    th { background: #f1f3f4; }
-    .badge { padding: 4px 12px; border-radius: 20px; font-weight: bold; }
-    .badge-green { background: #e6f4ea; color: #1e8e3e; }
-    .badge-red { background: #fce8e6; color: #c5221f; }
-    .badge-yellow { background: #fef7e0; color: #e37400; }
-  </style>
-</head>
-<body>
-  <div class="header"><h1>🛡️ TrackLace Guardian Dashboard</h1></div>
-  <div class="container">
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+#include <MPU6500_WE.h>
+#include <TinyGPSPlus.h>
+#include <HardwareSerial.h>
+#include <time.h>
+#include <math.h>
+
+// ── YOUR CREDENTIALS ─────────────────────────────────────────
+#define WIFI_SSID "itel"
+#define WIFI_PASSWORD "mywificode"
+
+#define FIREBASE_HOST "tracklace-f3b73-default-rtdb.firebaseio.com"
+#define FIREBASE_AUTH "AIzaSyBAPvmTe6Tyf2pZuYTrJs4Z8i5ASAALWJs"
+
+// ── CAREGIVER PHONE NUMBER ──────────────────────────────────
+const String GUARDIAN_PHONE = "+2347036597818"; 
+
+// ── PIN DEFINITIONS ──────────────────────────────────────────
+#define PIN_I2C_SDA 21
+#define PIN_I2C_SCL 22
+#define MPU6500_ADDR 0x68
+
+#define GPS_RX_PIN 16   // GPS TX → ESP32 RX2
+#define GPS_TX_PIN 17   // GPS RX → ESP32 TX2
+
+#define SIM_RX_PIN 5    // SIM800L TX → ESP32 RX1
+#define SIM_TX_PIN 18   // SIM800L RX → ESP32 TX1
+
+// ── GLOBALS ──────────────────────────────────────────────────
+HardwareSerial gpsSerial(2);
+HardwareSerial sim800Serial(1);
+
+MPU6500_WE myMPU6500 = MPU6500_WE(MPU6500_ADDR);
+TinyGPSPlus gps;
+
+bool mpuOK = false;
+unsigned long lastPublishMinute = 0;
+unsigned long lastHeartbeat = 0;
+unsigned long last20MinSMS = 0;
+unsigned long lastGeofenceCheck = 0;
+bool gpsFixAcquired = false;
+float totalAccel = 1.0f; 
+String currentActivity = "STATIONARY";
+
+// ── FALL DETECTION STATE ────────────────────────────────────
+enum FallState { IDLE, TILT_DETECTED, IMPACT_DETECTED };
+FallState fallState = IDLE;
+unsigned long tiltStartTime = 0;
+bool fallAlertSent = false;
+
+// ── GEOFENCE VARIABLES ──────────────────────────────────────
+float geoCenterLat = 0.0;
+float geoCenterLng = 0.0;
+float geoRadius = 0.0;
+bool geoLoaded = false;
+bool geofenceAlertSent = false;
+
+// ── SETUP ────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+
+  Serial.println("\n╔═════════════════════════════════════════╗");
+  Serial.println("║   TRACKLACE - FINAL (GEOFENCE + ALL)   ║");
+  Serial.println("╚═════════════════════════════════════════╝");
+
+  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+  mpuOK = myMPU6500.init();
+  if (mpuOK) {
+    myMPU6500.setAccRange(MPU6500_ACC_RANGE_8G);
+    Serial.println("[OK] MPU6050 found.");
+  }
+
+  gpsSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  sim800Serial.begin(9600, SERIAL_8N1, SIM_RX_PIN, SIM_TX_PIN);
+  delay(1000);
+  sim800Serial.println("AT"); delay(500);
+  
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.println("\n[OK] Wi-Fi Connected.");
+}
+
+// ── LOOP ─────────────────────────────────────────────────────
+void loop() {
+  // 1. Feed GPS data
+  while (gpsSerial.available()) {
+    gps.encode(gpsSerial.read());
+  }
+
+  // 2. GPS Fix acquired check
+  if (gps.location.isValid() && !gpsFixAcquired) {
+    gpsFixAcquired = true;
+    Serial.println("✅ GPS FIX ACQUIRED!");
+    last20MinSMS = millis(); // Start the 20-minute timer now
+  }
+
+  // 3. FALL DETECTION
+  if (mpuOK) {
+    static unsigned long lastAccelTime = 0;
+    if (millis() - lastAccelTime >= 100) {
+      lastAccelTime = millis();
+      xyzFloat gValue = myMPU6500.getGValues();
+      totalAccel = sqrt(pow(gValue.x, 2) + pow(gValue.y, 2) + pow(gValue.z, 2));
+
+      if (abs(totalAccel - 1.0f) < 0.2f) currentActivity = "STATIONARY";
+      else if (abs(totalAccel - 1.0f) < 0.5f) currentActivity = "WALKING";
+      else currentActivity = "MOVING";
+
+      float angle = acos(abs(gValue.z) / totalAccel) * (180.0 / PI);
+      static float prevAngle = angle;
+      float angleChange = abs(angle - prevAngle);
+      prevAngle = angle;
+
+      // Horizontal Fall
+      if (angleChange > 25.0f && totalAccel < 2.0f && fallState == IDLE) {
+        fallState = TILT_DETECTED;
+        tiltStartTime = millis();
+        Serial.println("[STAGE 1] Horizontal tilt detected!");
+      }
+
+      if (fallState == TILT_DETECTED) {
+        if (angle < 30.0f && abs(totalAccel - 1.0f) < 0.4f) {
+          if (millis() - tiltStartTime > 500) {
+            Serial.println("\n🚨 [STAGE 2] DEVICE LAYING FLAT! CONFIRMED HORIZONTAL FALL! 🚨");
+            triggerFallAlert(); 
+            fallState = IDLE; 
+            fallAlertSent = true;
+          }
+        }
+        else if (angle > 50.0f && millis() - tiltStartTime > 1000) {
+          fallState = IDLE;
+          fallAlertSent = false;
+          Serial.println("[RESET] Device back upright. No fall.");
+        }
+      }
+
+      // Vertical Fall
+      static int freeFallCount = 0;
+      if (totalAccel < 0.4f) {
+        freeFallCount++;
+        if (freeFallCount == 1 && fallState == IDLE) {
+          tiltStartTime = millis();
+          fallState = TILT_DETECTED;
+          Serial.println("[STAGE 1] Vertical free-fall detected!");
+        }
+      } else {
+        freeFallCount = 0;
+      }
+
+      if (fallState == TILT_DETECTED && totalAccel > 3.5f && millis() - tiltStartTime < 2000 && !fallAlertSent) {
+        Serial.println("\n🚨 [STAGE 2] IMPACT DETECTED! CONFIRMED VERTICAL FALL! 🚨");
+        triggerFallAlert(); 
+        fallState = IDLE;
+        fallAlertSent = true;
+      }
+
+      if (fallAlertSent && millis() - tiltStartTime > 5000) {
+        fallAlertSent = false;
+        fallState = IDLE;
+        Serial.println("[RESET] Ready for next fall.\n");
+      }
+    }
+  }
+
+  // 4. HEARTBEAT (Every 10 seconds to keep website alive)
+  if (millis() - lastHeartbeat > 10000) {
+    lastHeartbeat = millis();
+    StaticJsonDocument<256> doc;
+    if (gps.location.isValid()) {
+      doc["lat"] = gps.location.lat();
+      doc["lng"] = gps.location.lng();
+      doc["gpsStatus"] = "FIXED";
+    } else {
+      doc["lat"] = 9.656186; // Default FUT Minna coords
+      doc["lng"] = 6.529398;
+      doc["gpsStatus"] = "Searching";
+    }
+    doc["activity"] = currentActivity;
+    doc["timestamp"] = getISOTime();
+
+    String json;
+    serializeJson(doc, json);
+    sendToFirebase("/necklace", json);
+    Serial.println("[HEARTBEAT] Status sent to website.");
+  }
+
+  // 5. SAVE TO HISTORY (Every 5 minutes, only when GPS fixed)
+  if (gps.location.isValid() && millis() - lastPublishMinute > 300000) {
+    lastPublishMinute = millis();
+
+    StaticJsonDocument<256> doc;
+    doc["lat"] = gps.location.lat();
+    doc["lng"] = gps.location.lng();
+    doc["activity"] = currentActivity;
+    doc["timestamp"] = getISOTime();
+
+    String json;
+    serializeJson(doc, json);
+    String path = "/history/" + String(millis());
+    sendToFirebase(path, json);
+    Serial.println("[HISTORY] Data saved to website history.");
+  }
+
+  // 6. LOCATION SMS (Every 20 minutes, only when GPS fixed)
+  if (gpsFixAcquired && gps.location.isValid() && millis() - last20MinSMS > 1200000) { 
+    last20MinSMS = millis();
+    String mapsLink = "https://maps.google.com/?q=" + String(gps.location.lat(), 6) + "," + String(gps.location.lng(), 6);
+    String smsMsg = "TrackLace Location Update: " + mapsLink;
     
-    <div class="card">
-      <div class="grid">
-        <div class="stat"><h4>🛰️ GPS Status</h4><p id="gpsStatus">Waiting...</p></div>
-        <div class="stat"><h4>⚠️ Fall Status</h4><p id="fallStatus">Monitoring</p></div>
-        <div class="stat"><h4>🚶 Activity</h4><p id="activity">--</p></div>
-        <div class="stat"><h4>📌 Position</h4><p id="position">--</p></div>
-      </div>
-    </div>
+    sim800Serial.println("AT+CMGF=1"); delay(500);
+    sim800Serial.print("AT+CMGS=\""); sim800Serial.print(GUARDIAN_PHONE); sim800Serial.println("\""); delay(500);
+    sim800Serial.print(smsMsg); delay(500);
+    sim800Serial.write(26); delay(3000);
+    Serial.println("[SIM800L] 20-minute location SMS sent.");
+  }
 
-    <div class="card"><div id="map"></div></div>
-
-    <div class="card">
-      <h2>📜 Last 10 Events</h2>
-      <table>
-        <thead><tr><th>Time</th><th>Lat</th><th>Lng</th><th>Activity</th></tr></thead>
-        <tbody id="historyBody"></tbody>
-      </table>
-    </div>
-  </div>
-
-  <script>
-    // ── YOUR FIREBASE CONFIG ─────────────────────────────────
-    const firebaseConfig = {
-      apiKey: "AIzaSyBAPvmTe6Tyf2pZuYTrJs4Z8i5ASAALWJs",
-      databaseURL: "https://tracklace-f3b73-default-rtdb.firebaseio.com"
-    };
-    firebase.initializeApp(firebaseConfig);
-    const db = firebase.database();
-
-    const map = L.map('map').setView([9.656, 6.529], 15);
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
-    let marker;
-
-    // ── Listen to main data ──────────────────────────────────
-    const neckRef = db.ref('/necklace');
-    neckRef.on('value', (snap) => {
-      const d = snap.val();
-      if (!d) return;
-      document.getElementById('gpsStatus').innerHTML = d.gpsStatus === 'FIXED' ? '<span class="badge badge-green">FIXED</span>' : '<span class="badge badge-yellow">Searching</span>';
-      document.getElementById('activity').innerText = d.activity || '--';
-      document.getElementById('position').innerText = d.lat && d.lng ? d.lat.toFixed(6) + ', ' + d.lng.toFixed(6) : 'No Fix';
-      if (d.lat && d.lng) {
-        const pos = [d.lat, d.lng];
-        if (marker) marker.setLatLng(pos);
-        else marker = L.marker(pos).addTo(map);
-        map.panTo(pos);
+  // 7. GEOFENCE CHECK (Check every 30 seconds, only when GPS fixed)
+  if (gps.location.isValid() && millis() - lastGeofenceCheck > 30000) {
+    lastGeofenceCheck = millis();
+    
+    // Load geofence data from Firebase once
+    if (!geoLoaded) {
+      String latStr = getFromFirebase("/geofence/lat");
+      String lngStr = getFromFirebase("/geofence/lng");
+      String radStr = getFromFirebase("/geofence/radius");
+      
+      if (latStr.length() > 0 && lngStr.length() > 0 && radStr.length() > 0) {
+        geoCenterLat = latStr.toFloat();
+        geoCenterLng = lngStr.toFloat();
+        geoRadius = radStr.toFloat();
+        if (geoCenterLat != 0.0) {
+          geoLoaded = true;
+          Serial.printf("[GEOFENCE] Loaded: Lat=%.6f, Lng=%.6f, Rad=%.0fm\n", geoCenterLat, geoCenterLng, geoRadius);
+        }
       }
-    });
+    }
 
-    // ── Listen to fall alerts ─────────────────────────────────
-    const alertRef = db.ref('/alerts/lastFall');
-    alertRef.on('value', (snap) => {
-      const f = snap.val();
-      if (f && f.status === 'FALL_DETECTED') {
-        document.getElementById('fallStatus').innerHTML = '<span class="badge badge-red">🚨 FALL DETECTED!</span>';
-        setTimeout(() => document.getElementById('fallStatus').innerHTML = 'Monitoring', 10000);
+    // Check distance if geofence is loaded
+    if (geoLoaded) {
+      float currentLat = gps.location.lat();
+      float currentLng = gps.location.lng();
+      
+      // Haversine formula to calculate distance in meters
+      float latDiff = (currentLat - geoCenterLat) * (M_PI / 180.0);
+      float lngDiff = (currentLng - geoCenterLng) * (M_PI / 180.0);
+      float a = sin(latDiff/2) * sin(latDiff/2) + cos(geoCenterLat * M_PI / 180.0) * cos(currentLat * M_PI / 180.0) * sin(lngDiff/2) * sin(lngDiff/2);
+      float c = 2 * atan2(sqrt(a), sqrt(1-a));
+      float distance = 6371000 * c; // Distance in meters
+
+      if (distance > geoRadius && !geofenceAlertSent) {
+        Serial.printf("[GEOFENCE] BREACH! Distance: %.0fm > %.0fm\n", distance, geoRadius);
+        sendGeofenceAlert();
+        geofenceAlertSent = true;
+      } 
+      else if (distance <= geoRadius && geofenceAlertSent) {
+        geofenceAlertSent = false;
+        Serial.println("[GEOFENCE] Back inside safe zone.");
       }
-    });
+    }
+  }
+}
 
-    // ── Listen to history ─────────────────────────────────────
-    const histRef = db.ref('/history').limitToLast(10);
-    histRef.on('value', (snap) => {
-      const h = snap.val();
-      const tbody = document.getElementById('historyBody');
-      tbody.innerHTML = '';
-      if (!h) return;
-      Object.keys(h).reverse().forEach(k => {
-        const r = h[k];
-        tbody.innerHTML += `<tr><td>${r.timestamp || '--'}</td><td>${r.lat || 0}</td><td>${r.lng || 0}</td><td>${r.activity || '--'}</td></tr>`;
-      });
-    });
-  </script>
-</body>
-</html>
+// ── TRIGGER FALL ALERT (Only Call) ──────────────────────────
+void triggerFallAlert() {
+  Serial.println("[SIM800L] Dialing caregiver... 15 seconds ring.");
+  sim800Serial.println("ATD" + GUARDIAN_PHONE + ";"); 
+  delay(15000); 
+  sim800Serial.println("ATH");
+  Serial.println("[SIM800L] Call ended.");
+
+  // Update Website
+  StaticJsonDocument<256> doc;
+  doc["status"] = "FALL_DETECTED";
+  doc["lat"] = gps.location.isValid() ? String(gps.location.lat(), 6) : "No GPS";
+  doc["lng"] = gps.location.isValid() ? String(gps.location.lng(), 6) : "No GPS";
+  doc["timestamp"] = getISOTime();
+  doc["activity"] = currentActivity;
+
+  String json;
+  serializeJson(doc, json);
+  sendToFirebase("/alerts/lastFall", json);
+  Serial.println("[FIREBASE] Fall alert sent to website.");
+}
+
+// ── TRIGGER GEOFENCE BREACH ALERT (SMS + Website) ──────────
+void sendGeofenceAlert() {
+  if (gps.location.isValid()) {
+    String mapsLink = "https://maps.google.com/?q=" + String(gps.location.lat(), 6) + "," + String(gps.location.lng(), 6);
+    String smsMsg = "⚠️ GEO-FENCE BREACH! Wearer left safe zone. Location: " + mapsLink;
+    
+    sim800Serial.println("AT+CMGF=1"); delay(500);
+    sim800Serial.print("AT+CMGS=\""); sim800Serial.print(GUARDIAN_PHONE); sim800Serial.println("\""); delay(500);
+    sim800Serial.print(smsMsg); delay(500);
+    sim800Serial.write(26); delay(3000);
+    Serial.println("[SIM800L] Geofence breach SMS sent.");
+    
+    // Update Website
+    StaticJsonDocument<256> doc;
+    doc["status"] = "GEOFENCE_BREACH";
+    doc["lat"] = gps.location.lat();
+    doc["lng"] = gps.location.lng();
+    doc["timestamp"] = getISOTime();
+    String json;
+    serializeJson(doc, json);
+    sendToFirebase("/alerts/lastGeofence", json);
+  }
+}
+
+// ── FIREBASE HTTP FUNCTIONS ──────────────────────────────────
+void sendToFirebase(String path, String jsonData) {
+  if (WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  http.begin("https://" + String(FIREBASE_HOST) + path + ".json?auth=" + String(FIREBASE_AUTH));
+  http.addHeader("Content-Type", "application/json");
+  int code = http.PUT(jsonData);
+  if(code == 200) Serial.printf("[HTTP] PUT to %s: OK\n", path.c_str());
+  else Serial.printf("[HTTP] PUT to %s: Code %d\n", path.c_str(), code);
+  http.end();
+}
+
+String getFromFirebase(String path) {
+  if (WiFi.status() != WL_CONNECTED) return "";
+  HTTPClient http;
+  http.begin("https://" + String(FIREBASE_HOST) + path + ".json?auth=" + String(FIREBASE_AUTH));
+  int code = http.GET();
+  String payload = "";
+  if (code == 200) {
+    payload = http.getString();
+  }
+  http.end();
+  return payload;
+}
+
+String getISOTime() {
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo, 100)) {
+    char buf[25];
+    strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
+    return String(buf);
+  }
+  return "Unknown";
+}
