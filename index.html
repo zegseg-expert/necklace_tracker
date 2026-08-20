@@ -1,346 +1,394 @@
-#include <WiFi.h>
-#include <HTTPClient.h>
-#include <ArduinoJson.h>
-#include <Wire.h>
-#include <MPU6500_WE.h>
-#include <TinyGPSPlus.h>
-#include <HardwareSerial.h>
-#include <time.h>
-#include <math.h>
-
-// ── YOUR CREDENTIALS ─────────────────────────────────────────
-#define WIFI_SSID "itel"
-#define WIFI_PASSWORD "mywificode"
-
-#define FIREBASE_HOST "tracklace-f3b73-default-rtdb.firebaseio.com"
-#define FIREBASE_AUTH "AIzaSyBAPvmTe6Tyf2pZuYTrJs4Z8i5ASAALWJs"
-
-// ── CAREGIVER PHONE NUMBER ──────────────────────────────────
-const String GUARDIAN_PHONE = "+2347036597818"; 
-
-// ── PIN DEFINITIONS ──────────────────────────────────────────
-#define PIN_I2C_SDA 21
-#define PIN_I2C_SCL 22
-#define MPU6500_ADDR 0x68
-
-#define GPS_RX_PIN 16   // GPS TX → ESP32 RX2
-#define GPS_TX_PIN 17   // GPS RX → ESP32 TX2
-
-#define SIM_RX_PIN 5    // SIM800L TX → ESP32 RX1
-#define SIM_TX_PIN 18   // SIM800L RX → ESP32 TX1
-
-// ── GLOBALS ──────────────────────────────────────────────────
-HardwareSerial gpsSerial(2);
-HardwareSerial sim800Serial(1);
-
-MPU6500_WE myMPU6500 = MPU6500_WE(MPU6500_ADDR);
-TinyGPSPlus gps;
-
-bool mpuOK = false;
-unsigned long lastPublishMinute = 0;
-unsigned long lastHeartbeat = 0;
-unsigned long last20MinSMS = 0;
-unsigned long lastGeofenceCheck = 0;
-bool gpsFixAcquired = false;
-float totalAccel = 1.0f; 
-String currentActivity = "STATIONARY";
-
-// ── FALL DETECTION STATE ────────────────────────────────────
-enum FallState { IDLE, TILT_DETECTED, IMPACT_DETECTED };
-FallState fallState = IDLE;
-unsigned long tiltStartTime = 0;
-bool fallAlertSent = false;
-
-// ── GEOFENCE VARIABLES ──────────────────────────────────────
-float geoCenterLat = 0.0;
-float geoCenterLng = 0.0;
-float geoRadius = 0.0;
-bool geoLoaded = false;
-bool geofenceAlertSent = false;
-
-// ── SETUP ────────────────────────────────────────────────────
-void setup() {
-  Serial.begin(115200);
-  delay(2000);
-
-  Serial.println("\n╔═════════════════════════════════════════╗");
-  Serial.println("║   TRACKLACE - FINAL (GEOFENCE + ALL)   ║");
-  Serial.println("╚═════════════════════════════════════════╝");
-
-  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
-  mpuOK = myMPU6500.init();
-  if (mpuOK) {
-    myMPU6500.setAccRange(MPU6500_ACC_RANGE_8G);
-    Serial.println("[OK] MPU6050 found.");
-  }
-
-  gpsSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
-  sim800Serial.begin(9600, SERIAL_8N1, SIM_RX_PIN, SIM_TX_PIN);
-  delay(1000);
-  sim800Serial.println("AT"); delay(500);
-  
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
-  Serial.println("\n[OK] Wi-Fi Connected.");
-}
-
-// ── LOOP ─────────────────────────────────────────────────────
-void loop() {
-  // 1. Feed GPS data
-  while (gpsSerial.available()) {
-    gps.encode(gpsSerial.read());
-  }
-
-  // 2. GPS Fix acquired check
-  if (gps.location.isValid() && !gpsFixAcquired) {
-    gpsFixAcquired = true;
-    Serial.println("✅ GPS FIX ACQUIRED!");
-    last20MinSMS = millis(); // Start the 20-minute timer now
-  }
-
-  // 3. FALL DETECTION
-  if (mpuOK) {
-    static unsigned long lastAccelTime = 0;
-    if (millis() - lastAccelTime >= 100) {
-      lastAccelTime = millis();
-      xyzFloat gValue = myMPU6500.getGValues();
-      totalAccel = sqrt(pow(gValue.x, 2) + pow(gValue.y, 2) + pow(gValue.z, 2));
-
-      if (abs(totalAccel - 1.0f) < 0.2f) currentActivity = "STATIONARY";
-      else if (abs(totalAccel - 1.0f) < 0.5f) currentActivity = "WALKING";
-      else currentActivity = "MOVING";
-
-      float angle = acos(abs(gValue.z) / totalAccel) * (180.0 / PI);
-      static float prevAngle = angle;
-      float angleChange = abs(angle - prevAngle);
-      prevAngle = angle;
-
-      // Horizontal Fall
-      if (angleChange > 25.0f && totalAccel < 2.0f && fallState == IDLE) {
-        fallState = TILT_DETECTED;
-        tiltStartTime = millis();
-        Serial.println("[STAGE 1] Horizontal tilt detected!");
-      }
-
-      if (fallState == TILT_DETECTED) {
-        if (angle < 30.0f && abs(totalAccel - 1.0f) < 0.4f) {
-          if (millis() - tiltStartTime > 500) {
-            Serial.println("\n🚨 [STAGE 2] DEVICE LAYING FLAT! CONFIRMED HORIZONTAL FALL! 🚨");
-            triggerFallAlert(); 
-            fallState = IDLE; 
-            fallAlertSent = true;
-          }
-        }
-        else if (angle > 50.0f && millis() - tiltStartTime > 1000) {
-          fallState = IDLE;
-          fallAlertSent = false;
-          Serial.println("[RESET] Device back upright. No fall.");
-        }
-      }
-
-      // Vertical Fall
-      static int freeFallCount = 0;
-      if (totalAccel < 0.4f) {
-        freeFallCount++;
-        if (freeFallCount == 1 && fallState == IDLE) {
-          tiltStartTime = millis();
-          fallState = TILT_DETECTED;
-          Serial.println("[STAGE 1] Vertical free-fall detected!");
-        }
-      } else {
-        freeFallCount = 0;
-      }
-
-      if (fallState == TILT_DETECTED && totalAccel > 3.5f && millis() - tiltStartTime < 2000 && !fallAlertSent) {
-        Serial.println("\n🚨 [STAGE 2] IMPACT DETECTED! CONFIRMED VERTICAL FALL! 🚨");
-        triggerFallAlert(); 
-        fallState = IDLE;
-        fallAlertSent = true;
-      }
-
-      if (fallAlertSent && millis() - tiltStartTime > 5000) {
-        fallAlertSent = false;
-        fallState = IDLE;
-        Serial.println("[RESET] Ready for next fall.\n");
-      }
-    }
-  }
-
-  // 4. HEARTBEAT (Every 10 seconds to keep website alive)
-  if (millis() - lastHeartbeat > 10000) {
-    lastHeartbeat = millis();
-    StaticJsonDocument<256> doc;
-    if (gps.location.isValid()) {
-      doc["lat"] = gps.location.lat();
-      doc["lng"] = gps.location.lng();
-      doc["gpsStatus"] = "FIXED";
-    } else {
-      doc["lat"] = 9.656186; // Default FUT Minna coords
-      doc["lng"] = 6.529398;
-      doc["gpsStatus"] = "Searching";
-    }
-    doc["activity"] = currentActivity;
-    doc["timestamp"] = getISOTime();
-
-    String json;
-    serializeJson(doc, json);
-    sendToFirebase("/necklace", json);
-    Serial.println("[HEARTBEAT] Status sent to website.");
-  }
-
-  // 5. SAVE TO HISTORY (Every 5 minutes, only when GPS fixed)
-  if (gps.location.isValid() && millis() - lastPublishMinute > 300000) {
-    lastPublishMinute = millis();
-
-    StaticJsonDocument<256> doc;
-    doc["lat"] = gps.location.lat();
-    doc["lng"] = gps.location.lng();
-    doc["activity"] = currentActivity;
-    doc["timestamp"] = getISOTime();
-
-    String json;
-    serializeJson(doc, json);
-    String path = "/history/" + String(millis());
-    sendToFirebase(path, json);
-    Serial.println("[HISTORY] Data saved to website history.");
-  }
-
-  // 6. LOCATION SMS (Every 20 minutes, only when GPS fixed)
-  if (gpsFixAcquired && gps.location.isValid() && millis() - last20MinSMS > 1200000) { 
-    last20MinSMS = millis();
-    String mapsLink = "https://maps.google.com/?q=" + String(gps.location.lat(), 6) + "," + String(gps.location.lng(), 6);
-    String smsMsg = "TrackLace Location Update: " + mapsLink;
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TrackLace Guardian Dashboard</title>
     
-    sim800Serial.println("AT+CMGF=1"); delay(500);
-    sim800Serial.print("AT+CMGS=\""); sim800Serial.print(GUARDIAN_PHONE); sim800Serial.println("\""); delay(500);
-    sim800Serial.print(smsMsg); delay(500);
-    sim800Serial.write(26); delay(3000);
-    Serial.println("[SIM800L] 20-minute location SMS sent.");
-  }
-
-  // 7. GEOFENCE CHECK (Check every 30 seconds, only when GPS fixed)
-  if (gps.location.isValid() && millis() - lastGeofenceCheck > 30000) {
-    lastGeofenceCheck = millis();
+    <!-- Leaflet Map CSS & JS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     
-    // Load geofence data from Firebase once
-    if (!geoLoaded) {
-      String latStr = getFromFirebase("/geofence/lat");
-      String lngStr = getFromFirebase("/geofence/lng");
-      String radStr = getFromFirebase("/geofence/radius");
-      
-      if (latStr.length() > 0 && lngStr.length() > 0 && radStr.length() > 0) {
-        geoCenterLat = latStr.toFloat();
-        geoCenterLng = lngStr.toFloat();
-        geoRadius = radStr.toFloat();
-        if (geoCenterLat != 0.0) {
-          geoLoaded = true;
-          Serial.printf("[GEOFENCE] Loaded: Lat=%.6f, Lng=%.6f, Rad=%.0fm\n", geoCenterLat, geoCenterLng, geoRadius);
+    <!-- Firebase SDK -->
+    <script src="https://www.gstatic.com/firebasejs/8.10.0/firebase-app.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/8.10.0/firebase-database.js"></script>
+
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            background: #e9ecef;
+            color: #333;
         }
-      }
-    }
+        .header {
+            background: #1a73e8;
+            color: white;
+            padding: 20px;
+            text-align: center;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+        }
+        .header h1 { margin: 0; font-size: 24px; }
+        .container {
+            max-width: 1000px;
+            margin: 20px auto;
+            padding: 0 15px;
+        }
+        .card {
+            background: white;
+            padding: 20px;
+            border-radius: 12px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 15px;
+        }
+        .stat {
+            text-align: center;
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #dee2e6;
+        }
+        .stat h4 {
+            margin: 0 0 5px 0;
+            color: #495057;
+            font-size: 14px;
+        }
+        .stat p {
+            font-size: 20px;
+            font-weight: bold;
+            margin: 0;
+        }
+        #map {
+            height: 400px;
+            width: 100%;
+            border-radius: 10px;
+            border: 1px solid #dee2e6;
+        }
+        .geo-controls {
+            margin-top: 15px;
+            padding-top: 15px;
+            border-top: 1px solid #dee2e6;
+        }
+        .geo-controls h3 { margin-top: 0; }
+        .slider-container {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        input[type="range"] {
+            flex-grow: 1;
+            cursor: pointer;
+        }
+        .btn {
+            background: #1a73e8;
+            color: white;
+            border: none;
+            padding: 12px 20px;
+            border-radius: 8px;
+            font-size: 16px;
+            cursor: pointer;
+            width: 100%;
+            margin-top: 10px;
+            font-weight: bold;
+            transition: background 0.2s;
+        }
+        .btn:hover { background: #1557b0; }
+        .btn:active { background: #0d47a1; }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 14px;
+        }
+        th, td {
+            padding: 10px;
+            text-align: left;
+            border-bottom: 1px solid #dee2e6;
+        }
+        th {
+            background: #f1f3f5;
+            color: #495057;
+        }
+        .status-badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-weight: bold;
+            font-size: 14px;
+        }
+        .badge-green { background: #d4edda; color: #155724; }
+        .badge-yellow { background: #fff3cd; color: #856404; }
+        .badge-red { background: #f8d7da; color: #721c24; }
+        
+        @media (max-width: 600px) {
+            .grid { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
 
-    // Check distance if geofence is loaded
-    if (geoLoaded) {
-      float currentLat = gps.location.lat();
-      float currentLng = gps.location.lng();
-      
-      // Haversine formula to calculate distance in meters
-      float latDiff = (currentLat - geoCenterLat) * (M_PI / 180.0);
-      float lngDiff = (currentLng - geoCenterLng) * (M_PI / 180.0);
-      float a = sin(latDiff/2) * sin(latDiff/2) + cos(geoCenterLat * M_PI / 180.0) * cos(currentLat * M_PI / 180.0) * sin(lngDiff/2) * sin(lngDiff/2);
-      float c = 2 * atan2(sqrt(a), sqrt(1-a));
-      float distance = 6371000 * c; // Distance in meters
+    <div class="header">
+        <h1>🛡️ TrackLace Guardian Dashboard</h1>
+        <p style="margin:5px 0 0; font-size:14px; opacity:0.9;">Real-time GPS, Fall Detection & Geofence</p>
+    </div>
 
-      if (distance > geoRadius && !geofenceAlertSent) {
-        Serial.printf("[GEOFENCE] BREACH! Distance: %.0fm > %.0fm\n", distance, geoRadius);
-        sendGeofenceAlert();
-        geofenceAlertSent = true;
-      } 
-      else if (distance <= geoRadius && geofenceAlertSent) {
-        geofenceAlertSent = false;
-        Serial.println("[GEOFENCE] Back inside safe zone.");
-      }
-    }
-  }
-}
+    <div class="container">
+        
+        <!-- Status Cards -->
+        <div class="card">
+            <div class="grid">
+                <div class="stat">
+                    <h4>🛰️ GPS Status</h4>
+                    <p id="gpsStatus"><span class="status-badge badge-yellow">Waiting...</span></p>
+                </div>
+                <div class="stat">
+                    <h4>⚠️ Fall Status</h4>
+                    <p id="fallStatus">Monitoring</p>
+                </div>
+                <div class="stat">
+                    <h4>🚶 Activity</h4>
+                    <p id="activity">--</p>
+                </div>
+                <div class="stat">
+                    <h4>📌 Position</h4>
+                    <p id="position" style="font-size: 16px;">--</p>
+                </div>
+            </div>
+        </div>
 
-// ── TRIGGER FALL ALERT (Only Call) ──────────────────────────
-void triggerFallAlert() {
-  Serial.println("[SIM800L] Dialing caregiver... 15 seconds ring.");
-  sim800Serial.println("ATD" + GUARDIAN_PHONE + ";"); 
-  delay(15000); 
-  sim800Serial.println("ATH");
-  Serial.println("[SIM800L] Call ended.");
+        <!-- Live Map & Geofence Controls -->
+        <div class="card">
+            <div id="map"></div>
+            
+            <div class="geo-controls">
+                <h3>📍 Set Geo-Fence</h3>
+                <p style="font-size: 14px; color: #6c757d; margin-top: -10px;">
+                    Click on the Live Map above to choose center, then adjust radius below.
+                </p>
+                <div class="slider-container">
+                    <span style="font-size: 12px; color: #6c757d;">50m</span>
+                    <input type="range" id="radiusSlider" min="50" max="1000" value="200" step="10">
+                    <span style="font-size: 12px; color: #6c757d;">1000m</span>
+                </div>
+                <div style="margin-top: 5px;">
+                    <strong>Radius: <span id="radiusDisplay">200</span> meters</strong>
+                </div>
+                <button id="sendGeofenceBtn" class="btn">📨 SEND GEO-FENCE TO NECKLACE</button>
+            </div>
+        </div>
 
-  // Update Website
-  StaticJsonDocument<256> doc;
-  doc["status"] = "FALL_DETECTED";
-  doc["lat"] = gps.location.isValid() ? String(gps.location.lat(), 6) : "No GPS";
-  doc["lng"] = gps.location.isValid() ? String(gps.location.lng(), 6) : "No GPS";
-  doc["timestamp"] = getISOTime();
-  doc["activity"] = currentActivity;
+        <!-- History Table -->
+        <div class="card">
+            <h2>📜 Last 10 Events History</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Latitude</th>
+                        <th>Longitude</th>
+                        <th>Activity</th>
+                    </tr>
+                </thead>
+                <tbody id="historyBody">
+                    <tr><td colspan="4" style="text-align: center; color: #6c757d;">Waiting for data...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
 
-  String json;
-  serializeJson(doc, json);
-  sendToFirebase("/alerts/lastFall", json);
-  Serial.println("[FIREBASE] Fall alert sent to website.");
-}
+    <!-- ── JAVASCRIPT ────────────────────────────────────────── -->
+    <script>
+        // ── YOUR FIREBASE CONFIG ──────────────────────────────
+        const firebaseConfig = {
+            apiKey: "AIzaSyBAPvmTe6Tyf2pZuYTrJs4Z8i5ASAALWJs",
+            databaseURL: "https://tracklace-f3b73-default-rtdb.firebaseio.com"
+        };
+        firebase.initializeApp(firebaseConfig);
+        const db = firebase.database();
 
-// ── TRIGGER GEOFENCE BREACH ALERT (SMS + Website) ──────────
-void sendGeofenceAlert() {
-  if (gps.location.isValid()) {
-    String mapsLink = "https://maps.google.com/?q=" + String(gps.location.lat(), 6) + "," + String(gps.location.lng(), 6);
-    String smsMsg = "⚠️ GEO-FENCE BREACH! Wearer left safe zone. Location: " + mapsLink;
-    
-    sim800Serial.println("AT+CMGF=1"); delay(500);
-    sim800Serial.print("AT+CMGS=\""); sim800Serial.print(GUARDIAN_PHONE); sim800Serial.println("\""); delay(500);
-    sim800Serial.print(smsMsg); delay(500);
-    sim800Serial.write(26); delay(3000);
-    Serial.println("[SIM800L] Geofence breach SMS sent.");
-    
-    // Update Website
-    StaticJsonDocument<256> doc;
-    doc["status"] = "GEOFENCE_BREACH";
-    doc["lat"] = gps.location.lat();
-    doc["lng"] = gps.location.lng();
-    doc["timestamp"] = getISOTime();
-    String json;
-    serializeJson(doc, json);
-    sendToFirebase("/alerts/lastGeofence", json);
-  }
-}
+        // ── INITIALIZE MAP ────────────────────────────────────
+        // Default view: Federal University of Technology, Minna
+        const map = L.map('map').setView([9.656186, 6.529398], 15);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+        }).addTo(map);
 
-// ── FIREBASE HTTP FUNCTIONS ──────────────────────────────────
-void sendToFirebase(String path, String jsonData) {
-  if (WiFi.status() != WL_CONNECTED) return;
-  HTTPClient http;
-  http.begin("https://" + String(FIREBASE_HOST) + path + ".json?auth=" + String(FIREBASE_AUTH));
-  http.addHeader("Content-Type", "application/json");
-  int code = http.PUT(jsonData);
-  if(code == 200) Serial.printf("[HTTP] PUT to %s: OK\n", path.c_str());
-  else Serial.printf("[HTTP] PUT to %s: Code %d\n", path.c_str(), code);
-  http.end();
-}
+        let marker = null;
+        let geofenceCircle = null;
 
-String getFromFirebase(String path) {
-  if (WiFi.status() != WL_CONNECTED) return "";
-  HTTPClient http;
-  http.begin("https://" + String(FIREBASE_HOST) + path + ".json?auth=" + String(FIREBASE_AUTH));
-  int code = http.GET();
-  String payload = "";
-  if (code == 200) {
-    payload = http.getString();
-  }
-  http.end();
-  return payload;
-}
+        // ── LISTEN TO MAIN DATA (/necklace) ───────────────────
+        const neckRef = db.ref('/necklace');
+        neckRef.on('value', (snapshot) => {
+            const data = snapshot.val();
+            if (!data) return;
 
-String getISOTime() {
-  struct tm timeinfo;
-  if (getLocalTime(&timeinfo, 100)) {
-    char buf[25];
-    strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
-    return String(buf);
-  }
-  return "Unknown";
-}
+            // Update GPS Status
+            const gpsEl = document.getElementById('gpsStatus');
+            if (data.gpsStatus === 'FIXED') {
+                gpsEl.innerHTML = '<span class="status-badge badge-green">Fixed</span>';
+            } else {
+                gpsEl.innerHTML = '<span class="status-badge badge-yellow">Searching</span>';
+            }
+
+            // Update Activity
+            document.getElementById('activity').innerText = data.activity || '--';
+
+            // Update Position
+            const posEl = document.getElementById('position');
+            if (data.lat && data.lng) {
+                posEl.innerText = data.lat.toFixed(6) + ', ' + data.lng.toFixed(6);
+            } else {
+                posEl.innerText = 'No Fix';
+            }
+
+            // Update Map Marker
+            if (data.lat && data.lng) {
+                const latlng = [data.lat, data.lng];
+                if (marker) {
+                    marker.setLatLng(latlng);
+                } else {
+                    marker = L.marker(latlng).addTo(map);
+                    marker.bindPopup("<b>Current Location</b>");
+                }
+                map.panTo(latlng);
+            }
+        });
+
+        // ── LISTEN TO FALL ALERTS (/alerts/lastFall) ──────────
+        const fallRef = db.ref('/alerts/lastFall');
+        fallRef.on('value', (snapshot) => {
+            const fall = snapshot.val();
+            const fallEl = document.getElementById('fallStatus');
+            if (fall && fall.status === 'FALL_DETECTED') {
+                fallEl.innerHTML = '<span class="status-badge badge-red">🚨 FALL DETECTED!</span>';
+                // Auto-reset after 10 seconds
+                setTimeout(() => {
+                    fallEl.innerText = 'Monitoring';
+                }, 10000);
+            } else {
+                fallEl.innerText = 'Monitoring';
+            }
+        });
+
+        // ── LISTEN TO GEOFENCE SETTINGS (/geofence) ───────────
+        const geoRef = db.ref('/geofence');
+        geoRef.on('value', (snapshot) => {
+            const g = snapshot.val();
+            if (g && g.lat && g.lng && g.radius) {
+                const center = [g.lat, g.lng];
+                // Remove old circle if it exists
+                if (geofenceCircle) map.removeLayer(geofenceCircle);
+                // Draw new circle
+                geofenceCircle = L.circle(center, {
+                    radius: g.radius,
+                    color: '#1a73e8',
+                    fillColor: '#1a73e8',
+                    fillOpacity: 0.15,
+                    weight: 2
+                }).addTo(map);
+                // Update UI sliders
+                document.getElementById('radiusSlider').value = g.radius;
+                document.getElementById('radiusDisplay').innerText = g.radius;
+            }
+        });
+
+        // ── LISTEN TO HISTORY (/history) ──────────────────────
+        const histRef = db.ref('/history').limitToLast(10);
+        histRef.on('value', (snapshot) => {
+            const hist = snapshot.val();
+            const tbody = document.getElementById('historyBody');
+            tbody.innerHTML = '';
+            if (!hist) {
+                tbody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: #6c757d;">No history yet...</td></tr>';
+                return;
+            }
+            // Get last 10 keys and reverse (newest first)
+            const keys = Object.keys(hist).slice(-10).reverse();
+            keys.forEach(key => {
+                const row = hist[key];
+                const tr = document.createElement('tr');
+                tr.innerHTML = `
+                    <td>${row.timestamp ? new Date(row.timestamp).toLocaleString() : '--'}</td>
+                    <td>${row.lat ? row.lat.toFixed(6) : '--'}</td>
+                    <td>${row.lng ? row.lng.toFixed(6) : '--'}</td>
+                    <td>${row.activity || '--'}</td>
+                `;
+                tbody.appendChild(tr);
+            });
+        });
+
+        // ── GEOFENCE UI CONTROLS ──────────────────────────────
+        let selectedGeoCenter = null;
+
+        // Update radius text when slider moves
+        document.getElementById('radiusSlider').addEventListener('input', function() {
+            document.getElementById('radiusDisplay').innerText = this.value;
+            // If center is already selected, redraw the circle with new radius
+            if (selectedGeoCenter) {
+                if (geofenceCircle) map.removeLayer(geofenceCircle);
+                const radius = parseInt(this.value);
+                geofenceCircle = L.circle(selectedGeoCenter, {
+                    radius: radius,
+                    color: '#1a73e8',
+                    fillColor: '#1a73e8',
+                    fillOpacity: 0.15,
+                    weight: 2
+                }).addTo(map);
+            }
+        });
+
+        // Click on map to set geofence center
+        map.on('click', function(e) {
+            selectedGeoCenter = e.latlng;
+            const radius = parseInt(document.getElementById('radiusSlider').value);
+            if (geofenceCircle) map.removeLayer(geofenceCircle);
+            geofenceCircle = L.circle(selectedGeoCenter, {
+                radius: radius,
+                color: '#1a73e8',
+                fillColor: '#1a73e8',
+                fillOpacity: 0.15,
+                weight: 2
+            }).addTo(map);
+            
+            // Show a small popup confirming the center
+            L.popup()
+                .setLatLng(selectedGeoCenter)
+                .setContent("📍 Geofence Center Set")
+                .openOn(map);
+        });
+
+        // Send Geofence to Firebase / ESP32
+        document.getElementById('sendGeofenceBtn').addEventListener('click', function() {
+            if (!selectedGeoCenter) {
+                alert("⚠️ Please click on the map to set a center point first!");
+                return;
+            }
+            const radius = parseInt(document.getElementById('radiusSlider').value);
+            const geoData = {
+                lat: selectedGeoCenter.lat,
+                lng: selectedGeoCenter.lng,
+                radius: radius,
+                timestamp: new Date().toISOString()
+            };
+            
+            // Write to Firebase
+            db.ref('/geofence').set(geoData)
+                .then(() => {
+                    alert("✅ Geofence sent to ESP32 successfully!");
+                })
+                .catch((error) => {
+                    alert("❌ Error sending geofence: " + error.message);
+                });
+        });
+
+        // ── INITIAL STARTUP MESSAGE ───────────────────────────
+        console.log("TrackLace Guardian Dashboard loaded successfully.");
+        console.log("Connected to Firebase:", firebaseConfig.databaseURL);
+    </script>
+</body>
+</html>
